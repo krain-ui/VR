@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AR English Sentence Maker Game</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- MediaPipe Hands & Camera Utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+  <style>
+    /* Glassmorphism Styling */
+    .glass {
+      background: rgba(255, 255, 255, 0.15);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+    }
+  </style>
+</head>
+<body class="bg-slate-900 text-white font-sans overflow-hidden select-none">
+
+  <!-- ==================== SCREEN 1: START SCREEN ==================== -->
+  <div id="startScreen" class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-950/90 backdrop-blur-md">
+    <div class="glass p-8 rounded-3xl text-center max-w-lg mx-4 border border-white/20 shadow-2xl">
+      <div class="text-6xl mb-4">🔤🖐️</div>
+      <h1 class="text-3xl font-bold mb-2 bg-gradient-to-r from-cyan-400 to-pink-400 bg-clip-text text-transparent">
+        AR English Sentence Game
+      </h1>
+      <p class="text-slate-300 mb-6 text-sm">
+        เกมเรียงประโยคภาษาอังกฤษด้วยเทคโนโลยี Hand Tracking ผ่านกล้อง หรือเลือกใช้เมาส์ลากวางคำศัพท์!
+      </p>
+      <button id="btnStartApp" class="px-8 py-4 bg-gradient-to-r from-emerald-400 to-teal-500 text-slate-950 text-xl font-bold rounded-2xl hover:scale-105 active:scale-95 transition shadow-lg shadow-emerald-500/20">
+        เข้าสู่เกม (Start)
+      </button>
+    </div>
+  </div>
+
+  <!-- ==================== MAIN GAME CONTAINER ==================== -->
+  <div class="relative w-screen h-screen overflow-hidden flex items-center justify-center bg-black">
+    
+    <!-- Video Element (Hidden: Draw onto canvas instead) -->
+    <video id="webcam" class="hidden" playsinline></video>
+
+    <!-- Canvas (Z-Index High: Render Video + Hand Mesh + UI Elements) -->
+    <canvas id="gameCanvas" class="absolute inset-0 w-full h-full z-10"></canvas>
+
+    <!-- HTML Overlay HUD (Score, Prompt, Level) -->
+    <div id="hudOverlay" class="absolute top-4 inset-x-4 z-20 flex justify-between items-center pointer-events-none hidden">
+      <!-- Target Sentence Box -->
+      <div class="glass px-6 py-3 rounded-2xl flex items-center gap-3">
+        <span class="text-xs uppercase tracking-wider text-cyan-300 font-bold">โจทย์:</span>
+        <span id="txtPrompt" class="text-xl font-bold text-yellow-300">ฉัน รัก สุนัข</span>
+      </div>
+
+      <!-- Level & Score -->
+      <div class="flex gap-4">
+        <div class="glass px-5 py-3 rounded-2xl text-center">
+          <div class="text-xs text-slate-400 font-bold">ด่าน</div>
+          <div id="txtLevel" class="text-xl font-black text-emerald-400">1/3</div>
+        </div>
+        <div class="glass px-5 py-3 rounded-2xl text-center">
+          <div class="text-xs text-slate-400 font-bold">คะแนน</div>
+          <div id="txtScore" class="text-xl font-black text-amber-400">0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tracking Alert Overlay -->
+    <div id="handAlert" class="absolute top-20 z-20 glass px-4 py-2 rounded-full text-amber-300 text-sm font-semibold animate-pulse hidden pointer-events-none">
+      ⚠️ กำลังหามือของคุณ... (สามารถใช้เมาส์คลิกลากวางได้)
+    </div>
+
+  </div>
+
+  <!-- ==================== GAME LOGIC SCRIPT ==================== -->
+  <script>
+    // ----------------------------------------------------
+    // 1. DATA & CONSTANTS
+    // ----------------------------------------------------
+    const LEVELS = [
+      {
+        prompt: "ฉัน รัก สุนัข",
+        target: ["I", "love", "dogs"],
+        words: [
+          { text: "love", emoji: "❤️" },
+          { text: "I", emoji: "🙋" },
+          { text: "dogs", emoji: "🐶" },
+          { text: "cats", emoji: "🐱" } // Distractor
+        ]
+      },
+      {
+        prompt: "แมว ตัวนั้น น่ารัก",
+        target: ["The", "cat", "is", "cute"],
+        words: [
+          { text: "is", emoji: "✨" },
+          { text: "The", emoji: "👉" },
+          { text: "cute", emoji: "🥰" },
+          { text: "cat", emoji: "🐱" }
+        ]
+      },
+      {
+        prompt: "นก บิน อยู่ใน ท้องฟ้า",
+        target: ["Birds", "fly", "in", "sky"],
+        words: [
+          { text: "sky", emoji: "☁️" },
+          { text: "Birds", emoji: "🐦" },
+          { text: "in", emoji: "📥" },
+          { text: "fly", emoji: "🕊️" },
+          { text: "fish", emoji: "🐟" } // Distractor
+        ]
+      }
+    ];
+
+    // State Variables
+    let currentLevelIdx = 0;
+    let score = 0;
+    let gameState = 'START'; // 'START', 'INSTRUCTION', 'PLAYING', 'CLEAR'
+    
+    // Hand tracking & Interaction state
+    let handLandmarks = null;
+    let pointerX = -100, pointerY = -100;
+    let isPinched = false;
+    let wasPinched = false; // For click trigger
+    let cursorStatus = 'NORMAL'; // NORMAL, HOVER, MISS, GRAB
+
+    // Mouse Fallback state
+    let isMouseDown = false;
+    let usingMouse = false;
+
+    // Word Cards & Slots Position
+    let wordCards = [];
+    let targetSlots = [];
+    let draggedCard = null;
+
+    // Elements
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const video = document.getElementById('webcam');
+    const hudOverlay = document.getElementById('hudOverlay');
+    const handAlert = document.getElementById('handAlert');
+    const txtPrompt = document.getElementById('txtPrompt');
+    const txtLevel = document.getElementById('txtLevel');
+    const txtScore = document.getElementById('txtScore');
+
+    // Button on Canvas state
+    let startBtnRect = { x: 0, y: 0, w: 220, h: 60 };
+
+    // ----------------------------------------------------
+    // 2. INITIALIZATION & RESIZE
+    // ----------------------------------------------------
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      if (gameState === 'PLAYING') {
+        setupLevelPositions();
+      }
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // ----------------------------------------------------
+    // 3. MEDIAPIPE HANDS SETUP
+    // ----------------------------------------------------
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    hands.onResults((results) => {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        handLandmarks = results.multiHandLandmarks[0];
+        handAlert.classList.add('hidden');
+        usingMouse = false;
+        processHandTracking();
+      } else {
+        handLandmarks = null;
+        if (gameState === 'PLAYING' && !usingMouse) {
+          handAlert.classList.remove('hidden');
+        }
+      }
+    });
+
+    function processHandTracking() {
+      if (!handLandmarks) return;
+
+      // Index Finger Tip (Landmark 8)
+      // Mirroring adjustment: X coordinate mirrored (1 - x)
+      const indexTip = handLandmarks[8];
+      const thumbTip = handLandmarks[4];
+
+      pointerX = (1 - indexTip.x) * canvas.width;
+      pointerY = indexTip.y * canvas.height;
+
+      // Calculate Pinch using Euclidean Distance (Pythagoras)
+      const thumbX = (1 - thumbTip.x) * canvas.width;
+      const thumbY = thumbTip.y * canvas.height;
+
+      const dx = pointerX - thumbX;
+      const dy = pointerY - thumbY;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      // Threshold for pinch (approx 40-50 pixels depending on screen)
+      isPinched = distance < 45;
+    }
+
+    // ----------------------------------------------------
+    // 4. MOUSE FALLBACK & EVENT LISTENERS
+    // ----------------------------------------------------
+    window.addEventListener('mousemove', (e) => {
+      if (!handLandmarks) {
+        usingMouse = true;
+        pointerX = e.clientX;
+        pointerY = e.clientY;
+      }
+    });
+
+    window.addEventListener('mousedown', () => {
+      if (!handLandmarks) {
+        usingMouse = true;
+        isMouseDown = true;
+        isPinched = true;
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (!handLandmarks) {
+        isMouseDown = false;
+        isPinched = false;
+      }
+    });
+
+    document.getElementById('btnStartApp').addEventListener('click', () => {
+      document.getElementById('startScreen').classList.add('hidden');
+      hudOverlay.classList.remove('hidden');
+      gameState = 'INSTRUCTION';
+      initCamera();
+    });
+
+    async function initCamera() {
+      const camera = new Camera(video, {
+        onFrame: async () => {
+          await hands.send({ image: video });
+        },
+        width: 1280,
+        height: 720
+      });
+      await camera.start();
+    }
+
+    // ----------------------------------------------------
+    // 5. GAME LEVEL & CARDS SETUP
+    // ----------------------------------------------------
+    function loadLevel(idx) {
+      if (idx >= LEVELS.length) {
+        gameState = 'CLEAR';
+        return;
+      }
+
+      currentLevelIdx = idx;
+      const level = LEVELS[currentLevelIdx];
+      txtPrompt.innerText = level.prompt;
+      txtLevel.innerText = `${currentLevelIdx + 1}/${LEVELS.length}`;
+      txtScore.innerText = score;
+
+      setupLevelPositions();
+    }
+
+    function setupLevelPositions() {
+      const level = LEVELS[currentLevelIdx];
+      if (!level) return;
+
+      const cardW = 120;
+      const cardH = 120;
+      const slotW = 120;
+      const slotH = 120;
+
+      // 1. Setup Target Slots (Bottom Center)
+      targetSlots = [];
+      const totalSlots = level.target.length;
+      const slotGap = 20;
+      const startSlotX = (canvas.width - (totalSlots * slotW + (totalSlots - 1) * slotGap)) / 2;
+      const slotY = canvas.height - 180;
+
+      for (let i = 0; i < totalSlots; i++) {
+        targetSlots.push({
+          x: startSlotX + i * (slotW + slotGap),
+          y: slotY,
+          w: slotW,
+          h: slotH,
+          expectedText: level.target[i],
+          filledCard: null
+        });
+      }
+
+      // 2. Setup Word Cards (Floating Top/Mid Section)
+      wordCards = [];
+      const totalCards = level.words.length;
+      const cardGap = 25;
+      const startCardX = (canvas.width - (totalCards * cardW + (totalCards - 1) * cardGap)) / 2;
+      const cardY = 160;
+
+      level.words.forEach((item, index) => {
+        wordCards.push({
+          id: index,
+          text: item.text,
+          emoji: item.emoji,
+          x: startCardX + index * (cardW + cardGap),
+          y: cardY,
+          origX: startCardX + index * (cardW + cardGap),
+          origY: cardY,
+          w: cardW,
+          h: cardH,
+          isLocked: false,
+          placedSlot: null
+        });
+      });
+    }
+
+    // ----------------------------------------------------
+    // 6. MAIN GAME LOOP (INDEPENDENT DRAW LOOP)
+    // ----------------------------------------------------
+    function drawLoop() {
+      // Clear Canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw Video Background (Flipped Horizontally to fix Mirror issue)
+      if (video.readyState >= 2) {
+        ctx.save();
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      } else {
+        // Dark background fallback
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      // Render Hand Skeleton
+      drawHandSkeleton();
+
+      // Handle States
+      if (gameState === 'INSTRUCTION') {
+        drawInstructionScreen();
+      } else if (gameState === 'PLAYING') {
+        updateGameLogic();
+        drawGameUI();
+      } else if (gameState === 'CLEAR') {
+        drawClearScreen();
+      }
+
+      // Draw Hand/Mouse Cursor Overlay
+      drawCursor();
+
+      // Trigger tracking state update
+      wasPinched = isPinched;
+
+      requestAnimationFrame(drawLoop);
+    }
+
+    // Start Animation Loop
+    requestAnimationFrame(drawLoop);
+
+    // ----------------------------------------------------
+    // 7. RENDERING FUNCTIONS
+    // ----------------------------------------------------
+
+    // Draw MediaPipe Hand Mesh
+    function drawHandSkeleton() {
+      if (!handLandmarks) return;
+
+      ctx.save();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+      ctx.fillStyle = '#f43f5e';
+
+      // Hand Connections Map
+      const connections = [
+        [0,1],[1,2],[2,3],[3,4], // Thumb
+        [0,5],[5,6],[6,7],[7,8], // Index
+        [5,9],[9,10],[10,11],[11,12], // Middle
+        [9,13],[13,14],[14,15],[15,16], // Ring
+        [13,17],[17,18],[18,19],[19,20],[0,17] // Pinky & Palm
+      ];
+
+      connections.forEach(([i, j]) => {
+        const pt1 = handLandmarks[i];
+        const pt2 = handLandmarks[j];
+        ctx.beginPath();
+        ctx.moveTo((1 - pt1.x) * canvas.width, pt1.y * canvas.height);
+        ctx.lineTo((1 - pt2.x) * canvas.width, pt2.y * canvas.height);
+        ctx.stroke();
+      });
+
+      // Joint Points
+      handLandmarks.forEach((pt) => {
+        ctx.beginPath();
+        ctx.arc((1 - pt.x) * canvas.width, pt.y * canvas.height, 4, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      ctx.restore();
+    }
+
+    // Instruction Overlay Screen with Canvas Button
+    function drawInstructionScreen() {
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Instruction Box
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.lineWidth = 2;
+      const boxW = 500, boxH = 320;
+      const boxX = (canvas.width - boxW) / 2;
+      const boxY = (canvas.height - boxH) / 2 - 40;
+      
+      roundRect(ctx, boxX, boxY, boxW, boxH, 24, true, true);
+
+      // Text
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 28px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('วิธีควบคุมเกม (AR Control)', canvas.width / 2, boxY + 50);
+
+      ctx.font = '20px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('1. ใช้ "นิ้วชี้" ในการเลื่อนเคอร์เซอร์', canvas.width / 2, boxY + 110);
+      ctx.fillText('2. "จีบนิ้ว" (นิ้วโป้งแตะนิ้วชี้) เพื่อหยิบ/กด', canvas.width / 2, boxY + 150);
+      ctx.fillText('3. "กางนิ้ว" ออก เพื่อปล่อยคำศัพท์', canvas.width / 2, boxY + 190);
+
+      // Canvas Floating Green Button
+      startBtnRect.x = (canvas.width - startBtnRect.w) / 2;
+      startBtnRect.y = boxY + boxH + 30;
+
+      const isHover = isPointInRect(pointerX, pointerY, startBtnRect);
+
+      // Button background
+      ctx.fillStyle = isHover ? '#10b981' : '#059669';
+      roundRect(ctx, startBtnRect.x, startBtnRect.y, startBtnRect.w, startBtnRect.h, 18, true, false);
+
+      // Button Text
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.fillText('เริ่มเกม! 🚀', canvas.width / 2, startBtnRect.y + 38);
+
+      // Check click button
+      if (isHover && isPinched && !wasPinched) {
+        gameState = 'PLAYING';
+        loadLevel(0);
+      }
+
+      ctx.restore();
+    }
+
+    // Draw Main Game UI (Cards, Slots, Dropzone)
+    function drawGameUI() {
+      // 1. Draw Target Slots
+      targetSlots.forEach((slot, index) => {
+        ctx.save();
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+        ctx.strokeStyle = slot.filledCard ? '#10b981' : 'rgba(255, 255, 255, 0.4)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash(slot.filledCard ? [] : [8, 8]);
+        
+        roundRect(ctx, slot.x, slot.y, slot.w, slot.h, 20, true, true);
+
+        // Slot Index Number
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.font = 'bold 20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(index + 1, slot.x + slot.w / 2, slot.y + slot.h / 2 + 8);
+        ctx.restore();
+      });
+
+      // 2. Draw Word Cards (2.5D Style)
+      wordCards.forEach((card) => {
+        ctx.save();
+        
+        // Card Shadow (2.5D Effect)
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+        roundRect(ctx, card.x + 4, card.y + 6, card.w, card.h, 20, true, false);
+
+        // Card Glass Surface
+        ctx.fillStyle = card.isLocked ? 'rgba(16, 185, 129, 0.4)' : 'rgba(255, 255, 255, 0.25)';
+        ctx.strokeStyle = card.isLocked ? '#34d399' : 'rgba(255, 255, 255, 0.6)';
+        ctx.lineWidth = 2;
+        roundRect(ctx, card.x, card.y, card.w, card.h, 20, true, true);
+
+        // Card Emoji
+        ctx.font = '36px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(card.emoji, card.x + card.w / 2, card.y + 52);
+
+        // Card Text
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.fillText(card.text, card.x + card.w / 2, card.y + card.h - 20);
+
+        ctx.restore();
+      });
+    }
+
+    // All Clear Victory Screen
+    function drawClearScreen() {
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 56px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('🎉 All Clear! 🎉', canvas.width / 2, canvas.height / 2 - 40);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '24px sans-serif';
+      ctx.fillText(`คุณได้คะแนนทั้งหมด: ${score} คะแนน`, canvas.width / 2, canvas.height / 2 + 20);
+
+      // Restart Button
+      const btnW = 200, btnH = 60;
+      const btnX = (canvas.width - btnW) / 2;
+      const btnY = canvas.height / 2 + 70;
+      const isHover = isPointInRect(pointerX, pointerY, { x: btnX, y: btnY, w: btnW, h: btnH });
+
+      ctx.fillStyle = isHover ? '#3b82f6' : '#2563eb';
+      roundRect(ctx, btnX, btnY, btnW, btnH, 16, true, false);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px sans-serif';
+      ctx.fillText('เล่นใหม่อีกครั้ง', canvas.width / 2, btnY + 36);
+
+      if (isHover && isPinched && !wasPinched) {
+        score = 0;
+        loadLevel(0);
+        gameState = 'PLAYING';
+      }
+
+      ctx.restore();
+    }
+
+    // Custom Interactive Cursor
+    function drawCursor() {
+      ctx.save();
+      ctx.translate(pointerX, pointerY);
+
+      let color = '#38bdf8'; // Blue (NORMAL)
+      let radius = 18;
+      let lineDash = [];
+
+      if (cursorStatus === 'HOVER') {
+        color = '#facc15'; // Yellow
+        lineDash = [4, 4];
+      } else if (cursorStatus === 'MISS') {
+        color = '#f43f5e'; // Red
+      } else if (cursorStatus === 'GRAB') {
+        color = '#10b981'; // Green
+      }
+
+      // Outer Ring
+      ctx.beginPath();
+      ctx.arc(0, 0, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.setLineDash(lineDash);
+      ctx.stroke();
+
+      // Center Dot
+      ctx.beginPath();
+      ctx.arc(0, 0, 5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+
+      // Grab Success Checkmark ✔️
+      if (cursorStatus === 'GRAB') {
+        ctx.fillStyle = '#10b981';
+        ctx.font = 'bold 16px sans-serif';
+        ctx.fillText('✔️', 18, -12);
+      }
+
+      ctx.restore();
+    }
+
+    // ----------------------------------------------------
+    // 8. GAME INTERACTION & LOGIC
+    // ----------------------------------------------------
+    function updateGameLogic() {
+      let isHoveringCard = false;
+
+      // Reset hover status
+      if (!draggedCard) cursorStatus = 'NORMAL';
+
+      // Find card under cursor
+      for (let card of wordCards) {
+        if (card.isLocked) continue;
+
+        const hovering = isPointInRect(pointerX, pointerY, card);
+        if (hovering && !draggedCard) {
+          isHoveringCard = true;
+          cursorStatus = 'HOVER';
+
+          // Pinch / Mouse click to Grab
+          if (isPinched) {
+            draggedCard = card;
+            // Detach from slot if previously attached
+            if (card.placedSlot) {
+              card.placedSlot.filledCard = null;
+              card.placedSlot = null;
+            }
+          }
+        }
+      }
+
+      // Handle Dragging
+      if (draggedCard) {
+        cursorStatus = 'GRAB';
+        draggedCard.x = pointerX - draggedCard.w / 2;
+        draggedCard.y = pointerY - draggedCard.h / 2;
+
+        // Release / Drop Card
+        if (!isPinched) {
+          checkCardDrop(draggedCard);
+          draggedCard = null;
+        }
+      } else if (isPinched && !isHoveringCard) {
+        // Pinching in empty air -> MISS
+        cursorStatus = 'MISS';
+      }
+    }
+
+    function checkCardDrop(card) {
+      let droppedInSlot = false;
+
+      for (let slot of targetSlots) {
+        // Distance check between card center and slot center
+        const cardCenter = { x: card.x + card.w / 2, y: card.y + card.h / 2 };
+        const slotCenter = { x: slot.x + slot.w / 2, y: slot.y + slot.h / 2 };
+        const dist = Math.hypot(cardCenter.x - slotCenter.x, cardCenter.y - slotCenter.y);
+
+        if (dist < 70 && !slot.filledCard) {
+          // Snap into slot
+          card.x = slot.x;
+          card.y = slot.y;
+          card.placedSlot = slot;
+          slot.filledCard = card;
+          droppedInSlot = true;
+          break;
+        }
+      }
+
+      // If dropped outside, return to original position
+      if (!droppedInSlot) {
+        card.x = card.origX;
+        card.y = card.origY;
+      }
+
+      // Check if all slots are filled correctly
+      checkLevelCompletion();
+    }
+
+    function checkLevelCompletion() {
+      const allSlotsFilled = targetSlots.every(slot => slot.filledCard !== null);
+
+      if (allSlotsFilled) {
+        // Validate sentence order
+        let isCorrect = true;
+        targetSlots.forEach(slot => {
+          if (slot.filledCard.text !== slot.expectedText) {
+            isCorrect = false;
+          }
+        });
+
+        if (isCorrect) {
+          // Highlight locked cards
+          targetSlots.forEach(slot => slot.filledCard.isLocked = true);
+          score += 100;
+          txtScore.innerText = score;
+
+          // Next Level Delay
+          setTimeout(() => {
+            loadLevel(currentLevelIdx + 1);
+          }, 1000);
+        } else {
+          // Incorrect: Shake / Eject cards after short delay
+          setTimeout(() => {
+            targetSlots.forEach(slot => {
+              if (slot.filledCard) {
+                slot.filledCard.x = slot.filledCard.origX;
+                slot.filledCard.y = slot.filledCard.origY;
+                slot.filledCard.placedSlot = null;
+                slot.filledCard = null;
+              }
+            });
+          }, 800);
+        }
+      }
+    }
+
+    // Helper: Round Rectangle Drawing
+    function roundRect(ctx, x, y, width, height, radius, fill, stroke) {
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+      if (fill) ctx.fill();
+      if (stroke) ctx.stroke();
+    }
+
+    // Helper: Point in Rect test
+    function isPointInRect(px, py, rect) {
+      return px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h;
+    }
+  </script>
+</body>
+</html>
